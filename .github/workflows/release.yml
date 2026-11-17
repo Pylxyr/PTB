@@ -1,0 +1,258 @@
+name: Release
+
+# Builds the static Linux binary and publishes a GitHub release. You normally never run this by hand:
+# use "Cut release" (cut-release.yml). Other ways in:
+#   - push a tag vX.Y.Z whose version matches every version file   -> checks, build, publish
+#   - Run workflow here with a version                             -> dry run: builds, uploads artifacts, publishes nothing
+#   - called by cut-release.yml with the tag it just pushed        -> build, publish
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Dry run: version to build, as in Cargo.toml (e.g. 0.2.0 or 0.2.0-rc1). Builds and uploads artifacts; publishes nothing."
+        required: true
+  workflow_call:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, e.g. v0.2.0"
+        required: true
+        type: string
+      skip_checks:
+        description: "The caller already ran CI on this code"
+        required: false
+        type: boolean
+        default: false
+    # Only these secrets reach this workflow when cut-release.yml calls it (no `secrets: inherit`). All optional, as
+    # they are for a tag push or a manual run: an unset one is empty and the matching step is skipped or unsigned.
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: "Key for the AI release notes; unset means notes without AI"
+        required: false
+      AI_API_KEY:
+        description: "Key for the AI release notes (other provider); unset means notes without AI"
+        required: false
+      UPDATE_SIGNING_SEED:
+        description: "Ed25519 seed (hex) that signs SHA256SUMS.txt; unset means an unsigned checksum list"
+        required: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+  CC_x86_64_unknown_linux_musl: musl-gcc
+
+jobs:
+  version-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      # inputs.tag is empty (the triggering ref) for a tag push or a dry run, and the new tag when called.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          CALLED_TAG: ${{ inputs.tag }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -n "$CALLED_TAG" ]; then TAG="$CALLED_TAG"
+          elif [ "$EVENT" = "workflow_dispatch" ]; then TAG="v${INPUT_VERSION#v}"
+          else TAG="$REF_NAME"; fi
+          python scripts/bump_version.py --check "$TAG"
+          # A hand-pushed tag must sit on main: releases are built from reviewed history only.
+          if [ "$EVENT" = "push" ]; then
+            git fetch --quiet origin main
+            git merge-base --is-ancestor HEAD origin/main || { echo "::error::$TAG is not on main. Releases are only cut from main."; exit 1; }
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  # The same checks as every pull request. Skipped when cut-release.yml has just run them.
+  checks:
+    needs: version-guard
+    if: ${{ !inputs.skip_checks }}
+    uses: ./.github/workflows/ci.yml
+
+  # Runs alongside `checks`, not after it: nothing here needs their output, and waiting would put the whole CI run in
+  # front of the build. Nothing leaves this job except a workflow artifact; `publish` waits for both.
+  build:
+    needs: version-guard
+    if: ${{ !cancelled() && needs.version-guard.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.version-guard.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release
+      - name: musl-tools (C compiler for the static target)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Build the static release binary
+        run: cargo build --release --locked --target "$TARGET" -p pyxeetb
+      - name: The binary is static and reports this version
+        run: bash scripts/check-binary.sh "target/$TARGET/release/pyxeetb" "$VERSION"
+      - name: Package
+        run: |
+          name="pyxeetb-${VERSION}-${TARGET}"
+          mkdir -p "dist/$name" release
+          cp "target/$TARGET/release/pyxeetb" LICENSE README.md "dist/$name/"
+          # Reproducible: sorted entries, fixed owner and the commit's own time, no gzip timestamp.
+          tar -C dist --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="@$(git log -1 --format=%ct)" -cf - "$name" | gzip -n -9 > "release/$name.tar.gz"
+          ls -l release
+      - name: The unpacked package runs
+        run: |
+          tmp="$(mktemp -d)"
+          tar -xzf "release/pyxeetb-${VERSION}-${TARGET}.tar.gz" -C "$tmp"
+          for f in pyxeetb LICENSE README.md; do test -f "$tmp/pyxeetb-${VERSION}-${TARGET}/$f" || { echo "::error::$f is missing from the package"; exit 1; }; done
+          bash scripts/check-binary.sh "$tmp/pyxeetb-${VERSION}-${TARGET}/pyxeetb" "$VERSION"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-linux
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    needs: [version-guard, checks, build]
+    # A tag push, or a call from cut-release.yml. A manual dry run has neither.
+    # Nothing is published unless the checks passed (or cut-release.yml has just run them, so `checks` is skipped) and
+    # the build succeeded. The explicit status checks are required: without them GitHub applies an implicit success()
+    # over the whole dependency chain, so the (deliberately) skipped `checks` job would skip this job too, silently,
+    # even though the build succeeded.
+    if: ${{ !cancelled() && needs.version-guard.result == 'success' && (needs.checks.result == 'success' || needs.checks.result == 'skipped') && needs.build.result == 'success' && (github.event_name == 'push' || inputs.tag != '') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      models: read # lets the release-notes step use GitHub Models (free) with the built-in token
+    env:
+      TAG: ${{ needs.version-guard.outputs.tag }}
+      VERSION: ${{ needs.version-guard.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-linux
+          path: release
+      - name: Checksums
+        run: |
+          cd release
+          sha256sum ./*.tar.gz | sed 's# \./# #' > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      # The checksum list proves the download is intact; this signature proves it was made by the project (see
+      # docs/releasing.md, "Signing the checksum list").
+      - name: Sign the checksum list
+        env:
+          UPDATE_SIGNING_SEED: ${{ secrets.UPDATE_SIGNING_SEED }}
+          UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY }}
+        run: |
+          if [ -n "$UPDATE_SIGNING_SEED" ]; then
+            python3 scripts/sign_sums.py sign release/SHA256SUMS.txt
+            if [ -n "$UPDATE_PUBLIC_KEY" ]; then
+              python3 scripts/sign_sums.py verify release/SHA256SUMS.txt "$UPDATE_PUBLIC_KEY" || { echo "::error::The signing seed does not belong to the UPDATE_PUBLIC_KEY variable. Refusing to publish."; exit 1; }
+            fi
+          elif [ -n "$UPDATE_PUBLIC_KEY" ]; then
+            echo "::error::UPDATE_PUBLIC_KEY is set, so the server only installs signed releases, but the UPDATE_SIGNING_SEED secret is missing. Refusing to publish a release nobody could update to."
+            exit 1
+          else
+            echo "::warning::No update signing key is configured: the checksum list is not signed."
+          fi
+      # Needs a public repo, or GitHub Enterprise Cloud for a private one. Never blocks the release.
+      - name: Attest build provenance
+        id: attest
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/*.tar.gz
+      - name: Write release notes
+        env:
+          # AI release notes, tried in this order; with none available the notes come from commit messages and
+          # a read of the code (scripts/release_notes.py).
+          #  1. ANTHROPIC_API_KEY (optional secret)
+          #  2. AI_API_KEY secret + AI_BASE_URL and AI_MODEL variables (any OpenAI-compatible service)
+          #  3. GitHub Models, free, using the built-in token (needs `models: read` above)
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_BASE_URL: ${{ vars.AI_BASE_URL }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          RELEASE_NOTES_MODEL: ${{ vars.RELEASE_NOTES_MODEL }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SIGNED: ${{ hashFiles('release/SHA256SUMS.txt.sig') != '' }}
+          ATTESTED: ${{ steps.attest.outcome }}
+        run: |
+          {
+            cat .github/release-notes-header.md
+            echo
+            python3 scripts/release_notes.py --ai --tag "$TAG" --repo "$GITHUB_REPOSITORY" || {
+              echo "::warning::Could not build the changelog; publishing without it." >&2
+              echo "See the commit history for what changed."
+            }
+            echo
+            echo "## About this build"
+            echo
+            echo "A static x86_64 Linux binary (musl), built by GitHub Actions from the tagged commit."
+            if [ "$SIGNED" = "true" ]; then
+              echo "The checksum list is signed: \`SHA256SUMS.txt.sig\` is an Ed25519 signature of \`SHA256SUMS.txt\`."
+            else
+              echo "The checksum list is **not signed**."
+            fi
+            if [ "$ATTESTED" = "success" ]; then
+              echo "Build provenance: verify with \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY}\`."
+            fi
+          } > notes.md
+          cat notes.md
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
+      # The release is created as a draft, filled, and only then made public, so nobody ever sees a half-uploaded
+      # release. Safe to re-run: an existing release for the tag is updated instead of failing.
+      - name: Create the GitHub release
+        run: |
+          name="$(python3 -c 'import json; print(json.load(open("scripts/project.json"))["name"])')"
+          flags=()
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+            gh release edit "$TAG" --title "$name ${VERSION}" --notes-file notes.md --draft=false "${flags[@]}"
+          else
+            gh release create "$TAG" release/* \
+              --title "$name ${VERSION}" \
+              --notes-file notes.md \
+              --verify-tag \
+              --draft \
+              "${flags[@]}"
+            gh release edit "$TAG" --draft=false
+          fi
+          gh release view "$TAG" --json url --jq .url
