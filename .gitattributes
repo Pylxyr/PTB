@@ -1,0 +1,9 @@
+# Shell scripts run on Linux (CI and the server): CRLF breaks them (\r: command not found).
+*.sh text eol=lf
+# Keep the release machinery LF on Windows checkouts too, so patches and diffs stay clean.
+*.py text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+Cargo.lock text eol=lf
