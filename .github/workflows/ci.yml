@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Called by cut-release.yml (before it bumps anything) and by release.yml (for a hand-pushed tag).
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The C compiler for the static target (ring, the crypto under rustls, has a little C and assembly in it).
+  CC_x86_64_unknown_linux_musl: musl-gcc
+
+jobs:
+  # Everything that ships is built here: nothing is ever compiled on the server (a 1 GB, 1/8-OCPU machine).
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo clippy --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ci
+      - name: musl-tools (C compiler for the static target)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      # The exact build that gets released, on every change, so a problem with the static build shows up in a
+      # pull request and not on release day.
+      - name: Build the static release binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p pyxeetb
+      - name: The binary is static and runs
+        run: bash scripts/check-binary.sh target/x86_64-unknown-linux-musl/release/pyxeetb
+
+  # The release machinery is code too: it is tested on every change, and every file that carries the version must agree.
+  scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s scripts/tests -v
+      - name: Version files agree
+        run: python scripts/bump_version.py --check "v$(python scripts/bump_version.py --current)"
+
+  # Known vulnerabilities in Rust dependencies (RustSec). Reported, never blocking: make it blocking by removing
+  # continue-on-error once the baseline is clean.
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        continue-on-error: true
+        with:
+          command: check advisories
+          arguments: --locked
+
+  # One required check for branch protection: it fails if any job above failed or was cancelled.
+  ci-ok:
+    if: always()
+    needs: [rust, scripts, deny]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Results: $RESULTS"
+          case " $RESULTS " in *" failure "*|*" cancelled "*) exit 1 ;; esac
