@@ -1,0 +1,10 @@
+[package]
+name = "pyxeetb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Dependency-free building blocks shared by the PyxeeTB binaries: statistics, /proc parsing, report layout."
+
+[lints]
+workspace = true

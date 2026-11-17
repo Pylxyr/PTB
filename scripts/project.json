@@ -1,0 +1,6 @@
+{
+  "name": "PyxeeTB",
+  "slug": "pyxeetb",
+  "description": "a fast, self-hosted Twitch chat bot, alerts and overlay engine written in Rust, shipped as one static Linux binary for a small server",
+  "audience": "the streamers and moderators who run it"
+}
