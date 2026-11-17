@@ -1,0 +1,9 @@
+/target
+/out
+/dist
+probe-report.txt
+verification-report.txt
+ui/node_modules
+ui/dist
+# python bytecode from scripts/ and its tests
+__pycache__/
