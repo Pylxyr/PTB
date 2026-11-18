@@ -67,6 +67,7 @@ AREAS: tuple[tuple[str, str], ...] = (
     (r"(\.test\.ts$|_tests?\.rs$|(^|/)tests/)", "Tests"),
     (r"\.md$|^LICENSE|THIRD_PARTY", "Documentation"),
     (r"^crates/core/", "Core library"),
+    (r"^crates/twitch/", "Twitch protocol logic"),
     (r"^crates/bot/", "Bot service"),
     (r"^crates/", "Other crates"),
     (r"^ui/", "Web interface (dashboard and overlays)"),

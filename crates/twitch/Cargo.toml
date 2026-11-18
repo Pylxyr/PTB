@@ -1,0 +1,19 @@
+[package]
+name = "pyxeetb-twitch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Twitch protocol logic with no I/O: OAuth device flow, Helix bodies, EventSub frames, IRC lines."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

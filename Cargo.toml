@@ -1,15 +1,48 @@
 [workspace]
-resolver = "2"
-members = ["crates/core", "crates/bot"]
+# Resolver 3 picks the newest dependency versions that still build with `rust-version` below, which is the
+# newest Rust we ship with, so in practice it is simply the newest release of everything.
+resolver = "3"
+members = ["crates/core", "crates/twitch", "crates/bot"]
 
 [workspace.package]
 version = "0.0.1"
-edition = "2021"
+edition = "2024"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.100"
+repository = "https://github.com/Pylxyr/PTB"
+readme = "README.md"
+keywords = ["twitch", "chatbot", "streaming", "eventsub", "overlay"]
+categories = ["command-line-utilities", "network-programming"]
+publish = false
+
+# Versions live here once; the crates say `workspace = true`.
+[workspace.dependencies]
+pyxeetb-core = { path = "crates/core" }
+pyxeetb-twitch = { path = "crates/twitch" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Pure-Rust TLS with the `ring` provider: builds for the static musl target with only musl-gcc installed.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+needless_pass_by_value = "warn"
+redundant_clone = "warn"
+manual_let_else = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
 
 # What ships: one static binary for a 1 GB / 1/8-OCPU server. Whole-program optimisation and a single
 # code-generation unit make it smaller and faster; the build is slower, which only CI pays for.

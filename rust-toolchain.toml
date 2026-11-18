@@ -1,7 +1,7 @@
 # One place that decides the Rust version for local builds and every workflow (rustup >= 1.28 reads it).
 # The musl target is the one that ships: a static x86_64 binary for the Oracle E2.Micro server.
 [toolchain]
-channel = "1.91"
+channel = "1.100"
 components = ["clippy", "rustfmt"]
 targets = ["x86_64-unknown-linux-musl"]
 profile = "minimal"

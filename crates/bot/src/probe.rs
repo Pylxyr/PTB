@@ -1,21 +1,27 @@
 //! `pyxeetb probe`: what this machine is, how fast it really runs, and how far Twitch is from it.
 //!
 //! The network half times each stage of a fresh connection (DNS, TCP, TLS, first answer) against the Twitch
-//! endpoints the bot will use. The CPU half runs a fixed workload for a while and watches whether the speed
-//! holds: a 1/8-OCPU burstable server can look fast for a few seconds and then be slowed down.
-//! Nothing here needs a Twitch account; the IRC check logs in as an anonymous read-only `justinfan` user.
+//! endpoints the bot will use. The CPU half runs a fixed workload and watches whether the speed holds, and a
+//! separate idle test measures how late the machine wakes a sleeping thread, which is what the bot feels
+//! between chat messages. Nothing here needs a Twitch account: the IRC check logs in as an anonymous,
+//! read-only `justinfan` user.
 
+use std::fs;
 use std::hint::black_box;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use pyxeetb_core::procfs;
 use pyxeetb_core::report::{self, Report};
-use pyxeetb_core::stats;
+use pyxeetb_core::stats::{self, count_f64};
+use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
 use crate::cli::ProbeOptions;
+use crate::error::{Context, Result};
+use crate::net;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const SAMPLE_GAP: Duration = Duration::from_millis(250);
@@ -74,36 +80,12 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
-    build_tls_config(Vec::new())
-}
-
-/// The bundled Mozilla roots plus any extra trusted certificates (tests behind an inspecting proxy use this).
-fn build_tls_config(
-    extra_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
-) -> Result<Arc<rustls::ClientConfig>, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    for cert in extra_roots {
-        roots.add(cert).map_err(|e| format!("extra root: {e}"))?;
-    }
-    let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("TLS setup failed: {e}"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(Arc::new(config))
-}
-
 /// The HTTP status code of a response's first line, if the bytes so far contain one.
 fn parse_status_line(bytes: &[u8]) -> Option<u16> {
     let end = bytes.windows(2).position(|w| w == b"\r\n")?;
     let line = std::str::from_utf8(&bytes[..end]).ok()?;
     let mut parts = line.split_whitespace();
-    if !parts.next()?.starts_with("HTTP/") {
-        return None;
-    }
+    parts.next().filter(|p| p.starts_with("HTTP/"))?;
     parts.next()?.parse().ok()
 }
 
@@ -113,41 +95,8 @@ fn irc_welcomed(text: &str) -> bool {
         .any(|line| line.split_whitespace().nth(1) == Some("001"))
 }
 
-fn one_sample(target: &Target, config: &Arc<rustls::ClientConfig>) -> Result<Sample, String> {
-    let started = Instant::now();
-    let addrs: Vec<SocketAddr> = (target.host, target.port)
-        .to_socket_addrs()
-        .map_err(|e| format!("dns: {e}"))?
-        .collect();
-    let addr = addrs
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or(addrs.first())
-        .ok_or("dns: no address")?;
-    let dns = ms(started.elapsed());
-
-    let started = Instant::now();
-    let mut tcp =
-        TcpStream::connect_timeout(addr, IO_TIMEOUT).map_err(|e| format!("tcp connect: {e}"))?;
-    tcp.set_nodelay(true).ok();
-    tcp.set_read_timeout(Some(IO_TIMEOUT)).ok();
-    tcp.set_write_timeout(Some(IO_TIMEOUT)).ok();
-    let tcp_ms = ms(started.elapsed());
-
-    let started = Instant::now();
-    let name = rustls::pki_types::ServerName::try_from(target.host.to_string())
-        .map_err(|e| format!("tls name: {e}"))?;
-    let mut conn =
-        rustls::ClientConnection::new(Arc::clone(config), name).map_err(|e| format!("tls: {e}"))?;
-    while conn.is_handshaking() {
-        conn.complete_io(&mut tcp)
-            .map_err(|e| format!("tls handshake: {e}"))?;
-    }
-    let tls = ms(started.elapsed());
-    let mut stream = rustls::StreamOwned::new(conn, tcp);
-
-    let started = Instant::now();
-    let request = match target.kind {
+fn request_for(target: &Target) -> String {
+    match target.kind {
         Kind::Http { path } => format!(
             "GET {path} HTTP/1.1\r\nHost: {}\r\nUser-Agent: pyxeetb-probe/{}\r\nConnection: close\r\n\r\n",
             target.host,
@@ -157,64 +106,98 @@ fn one_sample(target: &Target, config: &Arc<rustls::ClientConfig>) -> Result<Sam
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.subsec_nanos());
-            format!("PASS SCHMOOPIIE\r\nNICK justinfan{}\r\n", 10_000 + nanos % 80_000)
-        }
-    };
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| format!("send: {e}"))?;
-    stream.flush().map_err(|e| format!("send: {e}"))?;
-
-    let mut received = Vec::new();
-    let mut buf = [0u8; 2048];
-    let deadline = Instant::now() + IO_TIMEOUT;
-    loop {
-        if Instant::now() > deadline {
-            return Err("no answer within 5 s".to_string());
-        }
-        let n = match stream.read(&mut buf) {
-            Ok(0) => return Err("connection closed before an answer".to_string()),
-            Ok(n) => n,
-            Err(e) => return Err(format!("read: {e}")),
-        };
-        received.extend_from_slice(&buf[..n]);
-        let answered = match target.kind {
-            Kind::Http { .. } => parse_status_line(&received).is_some(),
-            Kind::IrcWelcome => irc_welcomed(&String::from_utf8_lossy(&received)),
-        };
-        if answered {
-            break;
+            format!(
+                "PASS SCHMOOPIIE\r\nNICK justinfan{}\r\n",
+                10_000 + nanos % 80_000
+            )
         }
     }
+}
+
+fn has_answered(kind: Kind, received: &[u8]) -> bool {
+    match kind {
+        Kind::Http { .. } => parse_status_line(received).is_some(),
+        Kind::IrcWelcome => irc_welcomed(&String::from_utf8_lossy(received)),
+    }
+}
+
+/// Send the request and wait for the first usable answer.
+fn first_answer(
+    target: &Target,
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+) -> Result<f64> {
+    let started = Instant::now();
+    stream
+        .write_all(request_for(target).as_bytes())
+        .context("sending")?;
+    stream.flush().context("sending")?;
+    let mut received = Vec::new();
+    let mut buf = [0u8; 2048];
+    while started.elapsed() <= IO_TIMEOUT {
+        let n = stream.read(&mut buf).context("reading")?;
+        if n == 0 {
+            return Err(crate::error::Error::new(
+                "connection closed before an answer",
+            ));
+        }
+        received.extend_from_slice(&buf[..n]);
+        if has_answered(target.kind, &received) {
+            return Ok(ms(started.elapsed()));
+        }
+    }
+    Err(crate::error::Error::new("no answer within 5 s"))
+}
+
+fn one_sample(target: &Target, config: &Arc<ClientConfig>) -> Result<Sample> {
+    let started = Instant::now();
+    let addr = net::resolve(target.host, target.port)?;
+    let dns = ms(started.elapsed());
+
+    let started = Instant::now();
+    let tcp = TcpStream::connect_timeout(&addr, IO_TIMEOUT).context("tcp connect")?;
+    tcp.set_nodelay(true).context("tcp options")?;
+    tcp.set_read_timeout(Some(IO_TIMEOUT))
+        .context("tcp options")?;
+    tcp.set_write_timeout(Some(IO_TIMEOUT))
+        .context("tcp options")?;
+    let tcp_ms = ms(started.elapsed());
+
+    let started = Instant::now();
+    let name =
+        rustls::pki_types::ServerName::try_from(target.host.to_owned()).context("tls name")?;
+    let conn = ClientConnection::new(Arc::clone(config), name).context("tls")?;
+    let mut stream = StreamOwned::new(conn, tcp);
+    while stream.conn.is_handshaking() {
+        stream
+            .conn
+            .complete_io(&mut stream.sock)
+            .context("tls handshake")?;
+    }
+    let tls = ms(started.elapsed());
+
     Ok(Sample {
         dns,
         tcp: tcp_ms,
         tls,
-        first_answer: ms(started.elapsed()),
+        first_answer: first_answer(target, &mut stream)?,
     })
 }
 
+#[derive(Default)]
 struct TargetResult {
     samples: Vec<Sample>,
     failures: Vec<String>,
 }
 
-fn measure_target(
-    target: &Target,
-    config: &Arc<rustls::ClientConfig>,
-    count: usize,
-) -> TargetResult {
-    let mut result = TargetResult {
-        samples: Vec::new(),
-        failures: Vec::new(),
-    };
+fn measure_target(target: &Target, config: &Arc<ClientConfig>, count: usize) -> TargetResult {
+    let mut result = TargetResult::default();
     for i in 0..count {
         match one_sample(target, config) {
             Ok(sample) => result.samples.push(sample),
-            Err(message) => result.failures.push(message),
+            Err(e) => result.failures.push(e.to_string()),
         }
         if i + 1 < count {
-            std::thread::sleep(SAMPLE_GAP);
+            thread::sleep(SAMPLE_GAP);
         }
     }
     result
@@ -229,7 +212,7 @@ fn tally(failures: &[String]) -> Vec<(String, usize)> {
             None => counts.push((failure.clone(), 1)),
         }
     }
-    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     counts
 }
 
@@ -246,17 +229,15 @@ fn add_network_section(report: &mut Report, target: &Target, result: &TargetResu
             result.samples.len() + result.failures.len()
         ),
     );
+    let answer_label = match target.kind {
+        Kind::Http { .. } => "first http answer",
+        Kind::IrcWelcome => "irc welcome (001)",
+    };
     let stages: [Stage; 4] = [
         ("dns lookup", |s| s.dns),
         ("tcp connect", |s| s.tcp),
         ("tls handshake", |s| s.tls),
-        (
-            match target.kind {
-                Kind::Http { .. } => "first http answer",
-                Kind::IrcWelcome => "irc welcome (001)",
-            },
-            |s| s.first_answer,
-        ),
+        (answer_label, |s| s.first_answer),
     ];
     for (label, pick) in stages {
         let values: Vec<f64> = result.samples.iter().map(pick).collect();
@@ -270,7 +251,7 @@ fn add_network_section(report: &mut Report, target: &Target, result: &TargetResu
 }
 
 fn read_text(path: &str) -> Option<String> {
-    std::fs::read_to_string(path).ok()
+    fs::read_to_string(path).ok()
 }
 
 fn add_host_section(report: &mut Report) {
@@ -291,8 +272,7 @@ fn add_host_section(report: &mut Report) {
     );
     section.kv(
         "logical cpus",
-        std::thread::available_parallelism()
-            .map_or_else(|_| "unknown".to_string(), |n| n.to_string()),
+        thread::available_parallelism().map_or_else(|_| "unknown".to_owned(), |n| n.to_string()),
     );
     match read_text("/proc/meminfo").and_then(|t| procfs::parse_meminfo(&t)) {
         Some(mem) => {
@@ -309,6 +289,9 @@ fn add_host_section(report: &mut Report) {
 
 // ---- CPU throttling test ------------------------------------------------------------------------------------
 
+const TARGET_CHUNK: Duration = Duration::from_millis(20);
+const WINDOW: Duration = Duration::from_secs(2);
+
 /// A fixed amount of integer work. `black_box` keeps the optimiser from deleting it.
 fn work(iterations: u64) -> u64 {
     let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -320,20 +303,26 @@ fn work(iterations: u64) -> u64 {
     black_box(x)
 }
 
-/// Pick an iteration count that takes about 20 ms on an unthrottled core.
+/// An iteration count that takes about 20 ms on an unthrottled core.
+///
+/// Time stolen by the hypervisor can only make a trial slower, never faster, so the fastest of several trials is
+/// the machine's real speed; calibrating on a single trial under-estimates it and makes runs incomparable.
 fn calibrate() -> u64 {
-    let mut iterations = 1_000_000u64;
-    for _ in 0..4 {
-        let started = Instant::now();
-        work(iterations);
-        let elapsed = started.elapsed().as_secs_f64().max(1e-6);
-        iterations =
-            ((iterations as f64) * 0.020 / elapsed).clamp(10_000.0, 2_000_000_000.0) as u64;
-    }
-    iterations
+    const TRIAL: u64 = 1_000_000;
+    let fastest = (0..8)
+        .map(|_| {
+            let started = Instant::now();
+            work(TRIAL);
+            started.elapsed()
+        })
+        .min()
+        .unwrap_or(TARGET_CHUNK)
+        .max(Duration::from_micros(1));
+    let scaled = u128::from(TRIAL) * TARGET_CHUNK.as_nanos() / fastest.as_nanos();
+    u64::try_from(scaled)
+        .unwrap_or(u64::MAX)
+        .clamp(10_000, 2_000_000_000)
 }
-
-const WINDOW_SECONDS: f64 = 2.0;
 
 /// Work chunks completed per second in each consecutive window, and every chunk's duration in ms.
 struct Burst {
@@ -350,15 +339,17 @@ fn run_burst(seconds: u64) -> Burst {
         chunk_ms: Vec::new(),
     };
     let mut window_start = begin;
-    let mut in_window = 0u64;
+    let mut in_window = 0usize;
     while begin.elapsed() < total {
         let started = Instant::now();
         work(iterations);
         burst.chunk_ms.push(ms(started.elapsed()));
         in_window += 1;
-        let span = window_start.elapsed().as_secs_f64();
-        if span >= WINDOW_SECONDS {
-            burst.windows.push(in_window as f64 / span);
+        let span = window_start.elapsed();
+        if span >= WINDOW {
+            burst
+                .windows
+                .push(count_f64(in_window) / span.as_secs_f64());
             window_start = Instant::now();
             in_window = 0;
         }
@@ -391,35 +382,62 @@ fn add_cpu_section(report: &mut Report, seconds: u64) {
         section.latency("work chunk (~20 ms)", &summary);
     }
     if let Some(first) = burst.windows.first().copied().filter(|f| *f > 0.0) {
-        for (i, rate) in burst.windows.iter().enumerate() {
-            let from = i as f64 * WINDOW_SECONDS;
+        let mut from = 0.0;
+        for rate in &burst.windows {
+            let to = from + WINDOW.as_secs_f64();
             section.line(format!(
-                "{:>4.0}-{:<4.0} s  {:>7.1} chunks/s  {:>5.1}% of the first window",
-                from,
-                from + WINDOW_SECONDS,
-                rate,
+                "{from:>4.0}-{to:<4.0} s  {rate:>7.1} chunks/s  {:>5.1}% of the first window",
                 rate * 100.0 / first
             ));
+            from = to;
         }
     }
     if let Some(slowdown) = slowdown_percent(&burst.windows) {
         section.kv("slowest vs fastest", format!("{slowdown:.1}% slower"));
     }
-    match (before, after) {
-        (Some(b), Some(a)) => match procfs::steal_percent(&b, &a) {
-            Some(steal) => {
-                section.kv(
-                    "hypervisor steal",
-                    format!("{steal:.2}% of all CPU time during the test"),
-                );
-            }
-            None => {
-                section.kv("hypervisor steal", "no reading");
-            }
+    let steal = before
+        .zip(after)
+        .map(|(b, a)| procfs::steal_percent(&b, &a));
+    section.kv(
+        "hypervisor steal",
+        match steal {
+            Some(Some(percent)) => format!("{percent:.2}% of all CPU time during the test"),
+            Some(None) => "no reading".to_owned(),
+            None => "unavailable (no /proc/stat)".to_owned(),
         },
-        _ => {
-            section.kv("hypervisor steal", "unavailable (no /proc/stat)");
-        }
+    );
+}
+
+// ---- idle wake-up test --------------------------------------------------------------------------------------
+
+const JITTER_SLEEP: Duration = Duration::from_millis(5);
+const JITTER_LATE_MS: f64 = 10.0;
+
+/// How late each 5 ms sleep returned, in ms. On an idle machine this is what a socket event waits for a turn.
+fn run_jitter(seconds: u64) -> Vec<f64> {
+    let end = Instant::now() + Duration::from_secs(seconds);
+    let mut lateness = Vec::new();
+    while Instant::now() < end {
+        let started = Instant::now();
+        thread::sleep(JITTER_SLEEP);
+        lateness.push(ms(started.elapsed().saturating_sub(JITTER_SLEEP)));
+    }
+    lateness
+}
+
+fn add_jitter_section(report: &mut Report, seconds: u64) {
+    if seconds == 0 {
+        report
+            .section("Idle wake-up test")
+            .line("skipped (--jitter-seconds 0)");
+        return;
+    }
+    let lateness = run_jitter(seconds);
+    let section = report.section(format!("Idle wake-up test ({seconds} s of 5 ms sleeps)"));
+    if let Some(summary) = stats::summarize(&lateness) {
+        section.latency("wake-up lateness", &summary);
+        let late = lateness.iter().filter(|l| **l > JITTER_LATE_MS).count();
+        section.kv("later than 10 ms", format!("{late} of {}", lateness.len()));
     }
 }
 
@@ -427,14 +445,11 @@ fn add_process_section(report: &mut Report) {
     let (peak, current) =
         read_text("/proc/self/status").map_or((None, None), |t| procfs::parse_self_memory(&t));
     let section = report.section("This probe's own memory");
-    match (peak, current) {
-        (Some(peak), Some(current)) => {
-            section.kv("peak resident", report::mib(peak));
-            section.kv("resident at end", report::mib(current));
-        }
-        _ => {
-            section.line("unavailable (no /proc/self/status)");
-        }
+    if let Some((peak, current)) = peak.zip(current) {
+        section.kv("peak resident", report::mib(peak));
+        section.kv("resident at end", report::mib(current));
+    } else {
+        section.line("unavailable (no /proc/self/status)");
     }
 }
 
@@ -443,7 +458,7 @@ pub fn run(options: &ProbeOptions) -> String {
     let mut report = Report::new(format!("PyxeeTB probe {}", pyxeetb_core::VERSION));
     add_host_section(&mut report);
 
-    match tls_config() {
+    match net::tls_config() {
         Ok(config) => {
             for target in &TARGETS {
                 eprintln!(
@@ -454,11 +469,16 @@ pub fn run(options: &ProbeOptions) -> String {
                 add_network_section(&mut report, target, &result);
             }
         }
-        Err(message) => {
-            report.section("Twitch").line(message);
+        Err(e) => {
+            report.section("Twitch").line(e.to_string());
         }
     }
 
+    eprintln!(
+        "running the idle wake-up test ({} s)...",
+        options.jitter_seconds
+    );
+    add_jitter_section(&mut report, options.jitter_seconds);
     eprintln!("running the CPU test ({} s)...", options.burst_seconds);
     add_cpu_section(&mut report, options.burst_seconds);
     add_process_section(&mut report);
@@ -468,7 +488,6 @@ pub fn run(options: &ProbeOptions) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustls::pki_types::pem::PemObject;
 
     #[test]
     fn status_lines_are_parsed_once_complete() {
@@ -500,12 +519,12 @@ mod tests {
         assert_eq!(
             tally(&failures),
             vec![
-                ("a".to_string(), 3),
-                ("b".to_string(), 2),
-                ("c".to_string(), 1)
+                ("a".to_owned(), 3),
+                ("b".to_owned(), 2),
+                ("c".to_owned(), 1)
             ]
         );
-        assert!(tally(&[]).is_empty());
+        assert_eq!(tally(&[]), Vec::new());
     }
 
     #[test]
@@ -521,27 +540,38 @@ mod tests {
     fn work_is_deterministic_and_calibration_is_sane() {
         assert_eq!(work(1000), work(1000));
         assert_ne!(work(1000), work(1001));
-        let iterations = calibrate();
-        assert!((10_000..=2_000_000_000).contains(&iterations));
+        assert!((10_000..=2_000_000_000).contains(&calibrate()));
     }
 
     #[test]
-    fn a_zero_second_burst_is_skipped_in_the_report() {
+    fn a_zero_second_test_is_skipped_in_the_report() {
         let mut report = Report::new("t");
         add_cpu_section(&mut report, 0);
-        assert!(report.render().contains("skipped"));
+        add_jitter_section(&mut report, 0);
+        let text = report.render();
+        assert!(
+            text.contains("skipped (--burst-seconds 0)")
+                && text.contains("skipped (--jitter-seconds 0)"),
+            "{text}"
+        );
     }
 
     #[test]
-    fn a_short_burst_reports_windows_and_chunk_times() {
+    fn a_short_burst_reports_chunk_times() {
         let burst = run_burst(1);
-        assert!(!burst.chunk_ms.is_empty());
+        assert_ne!(burst.chunk_ms, Vec::<f64>::new());
         assert!(burst.chunk_ms.iter().all(|c| *c > 0.0));
     }
 
     #[test]
-    fn tls_config_builds_with_the_bundled_roots() {
-        assert!(tls_config().is_ok());
+    fn the_jitter_test_measures_lateness_that_is_never_negative() {
+        let lateness = run_jitter(1);
+        assert!(
+            lateness.len() > 20,
+            "about 200 sleeps fit in a second, got {}",
+            lateness.len()
+        );
+        assert!(lateness.iter().all(|l| *l >= 0.0));
     }
 
     /// Needs the internet, so it only runs on request: `cargo test -p pyxeetb -- --ignored`.
@@ -549,6 +579,7 @@ mod tests {
     #[test]
     #[ignore = "needs internet access"]
     fn live_https_round_trip_against_a_public_host() {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
         let target = Target {
             label: "test",
             host: "api.github.com",
@@ -556,11 +587,12 @@ mod tests {
             kind: Kind::Http { path: "/" },
         };
         // Behind a TLS-inspecting proxy the bundled roots are not enough; trust the machine's own store too.
-        let system: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls::pki_types::CertificateDer::pem_file_iter("/etc/ssl/certs/ca-certificates.crt")
-                .map(|certs| certs.filter_map(Result::ok).collect())
-                .unwrap_or_default();
-        let config = build_tls_config(system).unwrap();
+        let system: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_file_iter("/etc/ssl/certs/ca-certificates.crt").map_or_else(
+                |_| Vec::new(),
+                |certs| certs.filter_map(std::result::Result::ok).collect(),
+            );
+        let config = net::tls_config_with(system).unwrap();
         let sample = one_sample(&target, &config).expect("a round trip to api.github.com");
         assert!(
             sample.dns >= 0.0 && sample.tcp > 0.0 && sample.tls > 0.0 && sample.first_answer > 0.0,

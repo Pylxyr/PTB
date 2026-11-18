@@ -92,8 +92,8 @@ class WorkflowSafety(unittest.TestCase):
         self.assertGreaterEqual(len(run_blocks(CI)), 3)
 
     def test_ci_runs_everything_that_ships_and_has_one_required_check(self):
-        for step in ("cargo fmt --all -- --check", "cargo clippy --workspace --all-targets --locked -- -D warnings",
-                     "cargo test --workspace --locked", "--target x86_64-unknown-linux-musl", "check-binary.sh",
+        for step in ("cargo fmt --all -- --check", "bash scripts/clippy.sh",
+                     "cargo test --workspace --all-features --locked", "--target x86_64-unknown-linux-musl", "check-binary.sh",
                      "unittest discover -s scripts/tests", "bump_version.py --check"):
             self.assertIn(step, CI, step)
         self.assertIn("ci-ok:", CI)
@@ -185,6 +185,52 @@ class Project(unittest.TestCase):
         docs = (ROOT / "docs/releasing.md").read_text(encoding="utf-8")
         for title in ("Cut release", "Release"):
             self.assertIn(title, docs)
+
+
+class LintPolicy(unittest.TestCase):
+    """The clippy rule is non-negotiable: one command, every group denied, and no escape hatches in the code."""
+
+    CLIPPY = (ROOT / "scripts/clippy.sh").read_text(encoding="utf-8")
+    GROUPS = ("correctness", "suspicious", "complexity", "perf", "style", "pedantic", "cargo")
+
+    def test_the_clippy_command_denies_every_group_and_all_warnings(self):
+        self.assertIn("CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets --all-features", self.CLIPPY)
+        for group in self.GROUPS:
+            self.assertIn(f"-D clippy::{group}", self.CLIPPY, group)
+        self.assertNotRegex(self.CLIPPY, r"(?m)^\s*-A\s|--cap-lints|-W\s")
+
+    def test_ci_runs_that_script_and_nothing_weaker(self):
+        self.assertIn("bash scripts/clippy.sh", CI)
+        self.assertNotIn("clippy -- -D warnings", CI)
+        self.assertNotRegex(CI, r"clippy[^\n]*--cap-lints")
+
+    def test_no_rust_source_switches_a_lint_off(self):
+        pattern = re.compile(r"#!?\[\s*(allow|expect|warn|deny|forbid)\s*\(")
+        offenders = [
+            f"{path.relative_to(ROOT)}:{n}"
+            for path in sorted((ROOT / "crates").rglob("*.rs"))
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if pattern.search(line)
+        ]
+        self.assertEqual(offenders, [], "fix the code instead of suppressing the lint")
+
+    def test_the_workspace_lint_table_never_allows_anything(self):
+        manifest = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        self.assertNotRegex(manifest, r'=\s*"allow"')
+        self.assertNotRegex(manifest, r'level\s*=\s*"allow"')
+
+    def test_clippy_toml_has_exactly_one_accepted_duplicate_and_says_why(self):
+        config = (ROOT / "clippy.toml").read_text(encoding="utf-8")
+        self.assertIn('allowed-duplicate-crates = ["getrandom"]', config)
+        self.assertEqual(config.count("allowed-duplicate-crates"), 1)
+        self.assertIn("ring", config, "the reason must sit next to the exception")
+
+    def test_every_crate_inherits_the_workspace_lints_and_metadata(self):
+        for crate in sorted((ROOT / "crates").glob("*/Cargo.toml")):
+            text = crate.read_text(encoding="utf-8")
+            self.assertIn("[lints]\nworkspace = true", text, crate.parent.name)
+            for field in ("repository", "readme", "keywords", "categories", "license", "edition", "rust-version"):
+                self.assertIn(f"{field}.workspace = true", text, f"{crate.parent.name}: {field}")
 
 
 if __name__ == "__main__":

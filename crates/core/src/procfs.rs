@@ -23,6 +23,7 @@ pub struct CpuTimes {
 
 impl CpuTimes {
     /// Every counter that is time spent, idle and stolen time included.
+    #[must_use]
     pub fn total(&self) -> u64 {
         self.user
             + self.nice
@@ -40,6 +41,7 @@ fn kib_value(line: &str, key: &str) -> Option<u64> {
     rest.split_whitespace().next()?.parse().ok()
 }
 
+#[must_use]
 pub fn parse_meminfo(text: &str) -> Option<MemInfo> {
     let mut total = None;
     let mut available = None;
@@ -57,6 +59,7 @@ pub fn parse_meminfo(text: &str) -> Option<MemInfo> {
 }
 
 /// The first `model name` of `/proc/cpuinfo`, whitespace collapsed.
+#[must_use]
 pub fn parse_cpu_model(text: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
@@ -65,6 +68,7 @@ pub fn parse_cpu_model(text: &str) -> Option<String> {
 }
 
 /// The aggregate `cpu ` line of `/proc/stat`. Older kernels list fewer counters; missing ones count as 0.
+#[must_use]
 pub fn parse_cpu_times(text: &str) -> Option<CpuTimes> {
     let line = text.lines().find(|l| l.starts_with("cpu "))?;
     let mut n = line
@@ -86,17 +90,21 @@ pub fn parse_cpu_times(text: &str) -> Option<CpuTimes> {
 }
 
 /// Share of CPU time the hypervisor took away between two readings, in percent. `None` if no time passed.
+#[must_use]
 pub fn steal_percent(before: &CpuTimes, after: &CpuTimes) -> Option<f64> {
-    let total = after.total().checked_sub(before.total())?;
-    if total == 0 {
-        return None;
-    }
+    let total = after
+        .total()
+        .checked_sub(before.total())
+        .filter(|t| *t > 0)?;
     let steal = after.steal.saturating_sub(before.steal);
-    Some(steal as f64 * 100.0 / total as f64)
+    // Hundredths of a percent, in integers, so no float conversion of a 64-bit counter is needed.
+    let hundredths = u32::try_from(u128::from(steal) * 10_000 / u128::from(total)).ok()?;
+    Some(f64::from(hundredths) / 100.0)
 }
 
 /// Peak resident memory (`VmHWM`) and current resident memory (`VmRSS`) of this process from
 /// `/proc/self/status`, in KiB: `(peak, current)`.
+#[must_use]
 pub fn parse_self_memory(text: &str) -> (Option<u64>, Option<u64>) {
     let mut peak = None;
     let mut current = None;
@@ -111,6 +119,7 @@ pub fn parse_self_memory(text: &str) -> (Option<u64>, Option<u64>) {
 }
 
 /// `PRETTY_NAME` of `/etc/os-release`, quotes removed.
+#[must_use]
 pub fn parse_os_pretty_name(text: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let value = line.strip_prefix("PRETTY_NAME=")?;

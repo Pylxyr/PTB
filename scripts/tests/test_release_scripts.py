@@ -128,6 +128,7 @@ class CodeAnalysis(unittest.TestCase):
     def test_areas_and_labels(self):
         self.assertEqual(rn.area_of("crates/core/src/stats.rs"), "Core library")
         self.assertEqual(rn.area_of("crates/bot/src/probe.rs"), "Bot service")
+        self.assertEqual(rn.area_of("crates/twitch/src/irc.rs"), "Twitch protocol logic")
         self.assertEqual(rn.area_of("crates/bot/README.md"), "Documentation")
         self.assertEqual(rn.area_of("crates/bot/tests/cli.rs"), "Tests")
         self.assertEqual(rn.area_of(".github/workflows/ci.yml"), "Build and release")

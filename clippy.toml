@@ -1,0 +1,8 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+# Project and protocol names that are not code, so `doc_markdown` leaves them alone (".." keeps the defaults).
+doc-valid-idents = ["..", "EventSub", "PyxeeTB", "IRCv3", "SQLite", "StreamElements", "TwitchIO", "RustSec", "DNS", "TLS", "PRIVMSG", "ROOMSTATE"]
+# The newest `ring` (rustls' crypto) still depends on `getrandom` 0.2 while the newest `tungstenite` (WebSocket)
+# depends on `rand` 0.10, which needs `getrandom` 0.4. Neither can move, so this one duplicate is accepted; any
+# other duplicate is a failure. Remove this line when `ring` moves to a newer `getrandom`.
+allowed-duplicate-crates = ["getrandom"]

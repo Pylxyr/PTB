@@ -1,6 +1,8 @@
 //! A plain-text report that is easy to paste back into a chat or an issue: titled sections of lines, and
 //! one fixed layout for latency rows so two reports line up when compared.
 
+use std::fmt::{self, Display, Write as _};
+
 use crate::stats::Summary;
 
 #[derive(Debug, Default)]
@@ -16,7 +18,7 @@ impl Section {
     }
 
     /// `label: value`, the label padded so values line up inside a section.
-    pub fn kv(&mut self, label: &str, value: impl std::fmt::Display) -> &mut Self {
+    pub fn kv(&mut self, label: &str, value: impl Display) -> &mut Self {
         self.lines.push(format!("{label:<22}{value}"));
         self
     }
@@ -43,27 +45,36 @@ impl Report {
     }
 
     pub fn section(&mut self, heading: impl Into<String>) -> &mut Section {
+        let index = self.sections.len();
         self.sections.push(Section {
             heading: heading.into(),
             lines: Vec::new(),
         });
-        self.sections.last_mut().expect("a section was just pushed")
+        &mut self.sections[index]
     }
 
+    /// The report as text, ready to print or save.
+    #[must_use]
     pub fn render(&self) -> String {
-        let mut out = format!("{}\n", self.title);
+        self.to_string()
+    }
+}
+
+impl Display for Report {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}", self.title)?;
         for section in &self.sections {
-            out.push_str(&format!("\n== {} ==\n", section.heading));
+            write!(f, "\n== {} ==\n", section.heading)?;
             for line in &section.lines {
-                out.push_str(line);
-                out.push('\n');
+                writeln!(f, "{line}")?;
             }
         }
-        out
+        Ok(())
     }
 }
 
 /// The fixed layout of a latency row, in milliseconds with one decimal.
+#[must_use]
 pub fn latency_row(label: &str, s: &Summary) -> String {
     format!(
         "{label:<22}n={:<3} min {:>7.1}  p50 {:>7.1}  p95 {:>7.1}  p99 {:>7.1}  max {:>7.1}  ms",
@@ -71,9 +82,14 @@ pub fn latency_row(label: &str, s: &Summary) -> String {
     )
 }
 
-/// KiB as MiB with one decimal, for memory lines.
+/// KiB as MiB with one decimal (rounded), for memory lines.
+#[must_use]
 pub fn mib(kib: u64) -> String {
-    format!("{:.1} MiB", kib as f64 / 1024.0)
+    let tenths = (kib.saturating_mul(10) + 512) / 1024;
+    let mut out = String::new();
+    // Writing to a `String` cannot fail.
+    let _ = write!(out, "{}.{} MiB", tenths / 10, tenths % 10);
+    out
 }
 
 #[cfg(test)]
@@ -107,7 +123,9 @@ mod tests {
     #[test]
     fn long_labels_do_not_panic_or_truncate() {
         let s = summarize(&[1.0]).unwrap();
-        assert!(latency_row("a-very-long-label-indeed", &s).starts_with("a-very-long-label-indeed"));
+        assert!(
+            latency_row("a-very-long-label-indeed", &s).starts_with("a-very-long-label-indeed")
+        );
     }
 
     #[test]

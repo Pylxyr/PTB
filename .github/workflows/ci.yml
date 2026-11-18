@@ -41,8 +41,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      # Every lint group is an error and so is every rustc warning; see scripts/clippy.sh. Nothing in the code may
+      # switch a lint off (the scripts job checks that too).
+      - run: bash scripts/clippy.sh
+      - run: cargo test --workspace --all-features --locked
       # The exact build that gets released, on every change, so a problem with the static build shows up in a
       # pull request and not on release day.
       - name: Build the static release binary
