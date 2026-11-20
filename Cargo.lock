@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "pyxeetb"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "pyxeetb-core",
  "pyxeetb-twitch",
@@ -205,11 +205,11 @@ dependencies = [
 
 [[package]]
 name = "pyxeetb-core"
-version = "0.0.2"
+version = "0.0.3"
 
 [[package]]
 name = "pyxeetb-twitch"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "serde",
  "serde_json",
