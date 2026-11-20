@@ -20,6 +20,7 @@ use pyxeetb_twitch::irc;
 use pyxeetb_twitch::oauth::Tokens;
 use tungstenite::Message;
 
+use crate::cli::SendVia;
 use crate::endpoints::Endpoints;
 use crate::error::{Context, Error, Result};
 use crate::http::Http;
@@ -39,6 +40,7 @@ pub struct Plan<'a> {
     pub tokens: &'a Tokens,
     pub channel: &'a str,
     pub broadcaster_id: &'a str,
+    pub send_via: SendVia,
     pub count: usize,
     pub gap: Duration,
 }
@@ -64,6 +66,7 @@ enum Signal {
     Arrived {
         via: Via,
         message_id: String,
+        text: String,
         at: Instant,
     },
 }
@@ -140,6 +143,7 @@ fn irc_session(plan: &Plan<'_>, tx: &Sender<Signal>, stop: &AtomicBool) -> Resul
                     Signal::Arrived {
                         via: Via::Irc,
                         message_id: chat.id,
+                        text: chat.text,
                         at,
                     },
                 );
@@ -240,6 +244,7 @@ fn eventsub_session(plan: &Plan<'_>, tx: &Sender<Signal>, stop: &AtomicBool) -> 
                 Signal::Arrived {
                     via: Via::EventSub,
                     message_id: chat.message_id,
+                    text: chat.text,
                     at,
                 },
             ),
@@ -268,8 +273,8 @@ fn eventsub_session(plan: &Plan<'_>, tx: &Sender<Signal>, stop: &AtomicBool) -> 
 /// One test message as seen from this machine. Every value is in milliseconds.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Row {
-    /// How long the Helix send request took, start to answer.
-    pub http: f64,
+    /// How long the Helix send request took, start to answer; `None` when the message was sent over IRC.
+    pub send: Option<f64>,
     /// From the start of the send request until the message came back over each route.
     pub irc: Option<f64>,
     pub eventsub: Option<f64>,
@@ -291,6 +296,8 @@ struct Seen {
 struct Collector {
     rx: Receiver<Signal>,
     seen: HashMap<String, Seen>,
+    /// The id of every message text seen so far, so a message sent over IRC (which has no id yet) can be found.
+    ids: HashMap<String, String>,
     up: Vec<Via>,
     problems: Vec<String>,
 }
@@ -307,8 +314,10 @@ impl Collector {
             Signal::Arrived {
                 via,
                 message_id,
+                text,
                 at,
             } => {
+                self.ids.entry(text).or_insert_with(|| message_id.clone());
                 let slot = self.seen.entry(message_id).or_default();
                 match via {
                     Via::Irc => slot.irc.get_or_insert(at),
@@ -364,6 +373,20 @@ impl Collector {
         self.problems.iter().any(|p| p.starts_with(&prefix))
     }
 
+    /// The id of the message with this text, once either route has delivered it.
+    fn await_id(&mut self, text: &str) -> Option<String> {
+        let deadline = Instant::now() + ARRIVAL_TIMEOUT;
+        loop {
+            self.drain();
+            if let Some(id) = self.ids.get(text) {
+                return Some(id.clone());
+            }
+            if !self.wait_one(deadline) {
+                return None;
+            }
+        }
+    }
+
     /// Wait until the message has come back over every route that is up, or the time is out.
     fn await_arrivals(&mut self, id: &str) {
         let deadline = Instant::now() + ARRIVAL_TIMEOUT;
@@ -404,12 +427,12 @@ fn send_message(plan: &Plan<'_>, text: &str) -> Result<(String, Duration)> {
     Ok((sent.message_id, took))
 }
 
-fn row_for(started: Instant, took: Duration, seen: Option<&Seen>) -> Row {
+fn row_for(started: Instant, took: Option<Duration>, seen: Option<&Seen>) -> Row {
     let since = |at: Option<Instant>| {
         at.map(|t| t.saturating_duration_since(started).as_secs_f64() * 1000.0)
     };
     Row {
-        http: took.as_secs_f64() * 1000.0,
+        send: took.map(|d| d.as_secs_f64() * 1000.0),
         irc: seen.and_then(|s| since(s.irc)),
         eventsub: seen.and_then(|s| since(s.eventsub)),
     }
@@ -421,6 +444,112 @@ fn nonce() -> u32 {
         .map_or(0, |d| d.subsec_micros())
 }
 
+/// A second IRC connection used only for sending, so a write never waits behind the receiver's reads.
+struct IrcSender {
+    conn: net::Conn,
+    channel: String,
+    lines: irc::LineBuffer,
+}
+
+/// After joining, reads wait this long at most, which keeps `notices` from stalling a send.
+const SENDER_POLL: Duration = Duration::from_millis(1);
+
+impl IrcSender {
+    fn connect(plan: &Plan<'_>) -> Result<Self> {
+        let endpoints = plan.endpoints;
+        let tls = endpoints.irc_tls.then(net::tls_config).transpose()?;
+        let mut conn = net::connect(
+            &endpoints.irc_host,
+            endpoints.irc_port,
+            tls.as_ref(),
+            CONNECT_TIMEOUT,
+        )?;
+        let login = irc::login_lines(&plan.tokens.login, &plan.tokens.access_token, plan.channel);
+        conn.write_all(login.as_bytes())
+            .context("logging in the IRC sender")?;
+        conn.flush().context("logging in the IRC sender")?;
+        let mut lines = irc::LineBuffer::default();
+        let mut buf = [0u8; 4096];
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        while Instant::now() < deadline {
+            let n = match conn.read(&mut buf) {
+                Ok(0) => return Err(Error::new("the IRC sender connection was closed")),
+                Ok(n) => n,
+                Err(e) => return Err(e).context("waiting for the IRC sender to join"),
+            };
+            for line in lines.push(&buf[..n]) {
+                let Some(message) = irc::parse(&line) else {
+                    continue;
+                };
+                if let Some(why) = message.login_failure() {
+                    return Err(Error::new(format!("IRC login failed: {why}")));
+                }
+                if message.is_join_done() {
+                    conn.set_read_timeout(Some(SENDER_POLL))
+                        .context("setting the IRC sender read timeout")?;
+                    return Ok(Self {
+                        conn,
+                        channel: plan.channel.to_owned(),
+                        lines,
+                    });
+                }
+            }
+        }
+        Err(Error::new(
+            "the IRC sender did not join the channel in time",
+        ))
+    }
+
+    fn send(&mut self, text: &str) -> Result<()> {
+        self.conn
+            .write_all(irc::privmsg_line(&self.channel, text).as_bytes())
+            .context("writing to IRC")?;
+        self.conn.flush().context("writing to IRC")
+    }
+
+    /// What the server said since the last call that is worth reporting (rate limits, refusals).
+    fn notices(&mut self) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match self.conn.read(&mut buf) {
+                Ok(0) => {
+                    found.push("the IRC sender connection was closed".to_owned());
+                    return found;
+                }
+                Ok(n) => {
+                    for line in self.lines.push(&buf[..n]) {
+                        let Some(message) = irc::parse(&line) else {
+                            continue;
+                        };
+                        if let Some(pong) = irc::pong_for(&message) {
+                            // A failed write shows up as the next send failing, which is reported there.
+                            let _ = self.conn.write_all(pong.as_bytes());
+                        }
+                        if message.command == "NOTICE" {
+                            found.extend(message.trailing().map(str::to_owned));
+                        }
+                    }
+                }
+                Err(_) => return found,
+            }
+        }
+    }
+}
+
+/// Send over IRC, then learn the message's id from whichever route delivers it first.
+fn send_over_irc(
+    sender: &mut IrcSender,
+    collector: &mut Collector,
+    text: &str,
+) -> Result<(String, Option<Duration>)> {
+    sender.send(text)?;
+    let id = collector
+        .await_id(text)
+        .context("the message never came back over IRC or EventSub")?;
+    Ok((id, None))
+}
+
 fn measure(plan: &Plan<'_>, collector: &mut Collector) -> Vec<Row> {
     collector.await_ready();
     let mut rows = Vec::new();
@@ -430,6 +559,18 @@ fn measure(plan: &Plan<'_>, collector: &mut Collector) -> Vec<Row> {
             .push("neither route is up, so there is nothing to measure".to_owned());
         return rows;
     }
+    let mut sender = match plan.send_via {
+        SendVia::Helix => None,
+        SendVia::Irc => match IrcSender::connect(plan) {
+            Ok(sender) => Some(sender),
+            Err(e) => {
+                collector
+                    .problems
+                    .push(format!("the IRC sender could not start: {e}"));
+                return rows;
+            }
+        },
+    };
     for n in 1..=plan.count {
         // A unique suffix, because Twitch silently drops a message identical to the last one.
         let text = format!(
@@ -438,13 +579,24 @@ fn measure(plan: &Plan<'_>, collector: &mut Collector) -> Vec<Row> {
             nonce() % 1_000_000
         );
         let started = Instant::now();
-        match send_message(plan, &text) {
+        let sent = match sender.as_mut() {
+            Some(irc) => send_over_irc(irc, collector, &text),
+            None => send_message(plan, &text).map(|(id, took)| (id, Some(took))),
+        };
+        match sent {
             Ok((id, took)) => {
                 collector.await_arrivals(&id);
                 rows.push(row_for(started, took, collector.seen.get(&id)));
             }
             Err(e) => {
                 collector.problems.push(format!("message {n}: {e}"));
+                if let Some(irc) = sender.as_mut() {
+                    collector.problems.extend(
+                        irc.notices()
+                            .into_iter()
+                            .map(|notice| format!("IRC notice: {notice}")),
+                    );
+                }
                 break;
             }
         }
@@ -462,6 +614,7 @@ pub fn run(plan: &Plan<'_>) -> Outcome {
     let mut collector = Collector {
         rx,
         seen: HashMap::new(),
+        ids: HashMap::new(),
         up: Vec::new(),
         problems: Vec::new(),
     };
@@ -507,6 +660,13 @@ pub fn build_report(plan: &Plan<'_>, outcome: &Outcome) -> Report {
         )
         .kv("channel", plan.channel)
         .kv(
+            "send path",
+            match plan.send_via {
+                SendVia::Helix => "Helix (POST /chat/messages)",
+                SendVia::Irc => "IRC (PRIVMSG on its own connection)",
+            },
+        )
+        .kv(
             "messages sent",
             format!("{} of {} planned", rows.len(), plan.count),
         );
@@ -519,7 +679,7 @@ pub fn build_report(plan: &Plan<'_>, outcome: &Outcome) -> Report {
     add(
         "Helix send (the HTTP request alone)",
         "send round trip",
-        &column(rows, |r| Some(r.http)),
+        &column(rows, |r| r.send),
     );
     add(
         "Message back on this machine, from the start of the send",
@@ -563,8 +723,8 @@ pub fn build_report(plan: &Plan<'_>, outcome: &Outcome) -> Report {
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader};
-    use std::net::TcpListener;
-    use std::sync::Mutex;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
     use pyxeetb_twitch::Secret;
@@ -584,69 +744,166 @@ mod tests {
         }
     }
 
-    /// A local stand-in for Twitch: Helix over HTTP, IRC over a socket, EventSub over a WebSocket. A message
-    /// sent through the fake Helix comes back over IRC after `irc_delay` and over EventSub after `eventsub_delay`.
-    struct FakeTwitch {
-        http: MockHttp,
-        endpoints: Endpoints,
-    }
-
-    fn fake_twitch(
+    /// How the fake Twitch behaves.
+    #[derive(Clone, Copy)]
+    struct Behaviour {
+        /// A message sent anywhere comes back over IRC after this long, and over EventSub after the other.
         irc_delay: Duration,
         eventsub_delay: Duration,
-        irc_login_works: bool,
-    ) -> FakeTwitch {
-        let (irc_tx, irc_rx) = mpsc::channel::<String>();
-        let (ws_tx, ws_rx) = mpsc::channel::<String>();
+        receiver_login_ok: bool,
+        sender_login_ok: bool,
+    }
 
-        let irc_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let irc_port = irc_listener.local_addr().unwrap().port();
-        thread::spawn(move || {
-            let (stream, _) = irc_listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut writer = stream;
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                if line.starts_with("JOIN") {
-                    break;
-                }
-                line.clear();
+    impl Behaviour {
+        const fn healthy(irc_ms: u64, eventsub_ms: u64) -> Self {
+            Self {
+                irc_delay: Duration::from_millis(irc_ms),
+                eventsub_delay: Duration::from_millis(eventsub_ms),
+                receiver_login_ok: true,
+                sender_login_ok: true,
             }
-            if !irc_login_works {
-                let _ =
-                    writer.write_all(b":tmi.twitch.tv NOTICE * :Login authentication failed\r\n");
+        }
+    }
+
+    /// (message id, text)
+    type Delivery = (String, String);
+
+    /// Takes a posted message and delivers it back over both routes after their delays.
+    #[derive(Clone)]
+    struct Fanout {
+        irc: Sender<Delivery>,
+        eventsub: Sender<Delivery>,
+        behaviour: Behaviour,
+        counter: Arc<AtomicUsize>,
+    }
+
+    impl Fanout {
+        fn post(&self, prefix: &str, text: &str) -> String {
+            let id = format!("{prefix}-{}", self.counter.fetch_add(1, Ordering::SeqCst));
+            for (route, delay) in [
+                (&self.irc, self.behaviour.irc_delay),
+                (&self.eventsub, self.behaviour.eventsub_delay),
+            ] {
+                let (route, delivery) = (route.clone(), (id.clone(), text.to_owned()));
+                thread::spawn(move || {
+                    thread::sleep(delay);
+                    // The run may be over by now, which is fine.
+                    let _ = route.send(delivery);
+                });
+            }
+            id
+        }
+    }
+
+    fn read_until_join(reader: &mut BufReader<TcpStream>) {
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            if line.starts_with("JOIN") {
                 return;
             }
-            let _ = writer.write_all(b":bot.tmi.twitch.tv 366 bot #pylxyr :End of /NAMES list\r\n");
-            while let Ok(id) = irc_rx.recv() {
-                let line = format!(
-                    "@id={id} :pylxyr!pylxyr@pylxyr.tmi.twitch.tv PRIVMSG #pylxyr :hello\r\n"
-                );
-                if writer.write_all(line.as_bytes()).is_err() {
-                    return;
+            line.clear();
+        }
+    }
+
+    /// The first IRC connection reads chat: it joins, then repeats every delivery as a PRIVMSG.
+    fn irc_receiver(stream: TcpStream, deliveries: &Receiver<Delivery>, login_ok: bool) {
+        let mut writer = stream.try_clone().unwrap();
+        read_until_join(&mut BufReader::new(stream));
+        if !login_ok {
+            let _ = writer.write_all(b":tmi.twitch.tv NOTICE * :Login authentication failed\r\n");
+            return;
+        }
+        let _ = writer.write_all(b":bot.tmi.twitch.tv 366 bot #pylxyr :End of /NAMES list\r\n");
+        while let Ok((id, text)) = deliveries.recv() {
+            let line =
+                format!("@id={id} :pylxyr!pylxyr@pylxyr.tmi.twitch.tv PRIVMSG #pylxyr :{text}\r\n");
+            if writer.write_all(line.as_bytes()).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Any later IRC connection sends: it joins, then every PRIVMSG it receives is posted.
+    fn irc_sender(stream: TcpStream, fan: &Fanout) {
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        read_until_join(&mut reader);
+        if !fan.behaviour.sender_login_ok {
+            let _ = writer.write_all(b":tmi.twitch.tv NOTICE * :Login authentication failed\r\n");
+            return;
+        }
+        let _ = writer.write_all(b":bot.tmi.twitch.tv 366 bot #pylxyr :End of /NAMES list\r\n");
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            if let Some(text) = line.strip_prefix("PRIVMSG #pylxyr :") {
+                fan.post("irc", text.trim_end());
+            }
+            line.clear();
+        }
+    }
+
+    fn spawn_irc(fan: &Fanout, deliveries: Receiver<Delivery>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fan = fan.clone();
+        thread::spawn(move || {
+            let mut receiver_channel = Some(deliveries);
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let fan = fan.clone();
+                match receiver_channel.take() {
+                    Some(deliveries) => {
+                        thread::spawn(move || {
+                            irc_receiver(stream, &deliveries, fan.behaviour.receiver_login_ok);
+                        });
+                    }
+                    None => {
+                        thread::spawn(move || irc_sender(stream, &fan));
+                    }
                 }
             }
         });
+        port
+    }
 
-        let ws_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let ws_port = ws_listener.local_addr().unwrap().port();
+    fn spawn_eventsub(deliveries: Receiver<Delivery>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         thread::spawn(move || {
-            let (stream, _) = ws_listener.accept().unwrap();
+            let (stream, _) = listener.accept().unwrap();
             let mut socket = tungstenite::accept(stream).unwrap();
             let welcome = r#"{"metadata":{"message_type":"session_welcome"},"payload":{"session":{"id":"sess-1","keepalive_timeout_seconds":10}}}"#;
             socket.send(Message::text(welcome)).unwrap();
-            while let Ok(id) = ws_rx.recv() {
+            while let Ok((id, text)) = deliveries.recv() {
                 let frame = format!(
-                    r#"{{"metadata":{{"message_type":"notification","subscription_type":"channel.chat.message"}},"payload":{{"event":{{"broadcaster_user_id":"42","chatter_user_id":"42","chatter_user_login":"pylxyr","message_id":"{id}","message":{{"text":"hello"}}}}}}}}"#
+                    r#"{{"metadata":{{"message_type":"notification","subscription_type":"channel.chat.message"}},"payload":{{"event":{{"broadcaster_user_id":"42","chatter_user_id":"42","chatter_user_login":"pylxyr","message_id":"{id}","message":{{"text":"{text}"}}}}}}}}"#
                 );
                 if socket.send(Message::text(frame)).is_err() {
                     return;
                 }
             }
         });
+        port
+    }
 
-        let counter = AtomicUsize::new(0);
-        let channels = Mutex::new((irc_tx, ws_tx));
+    /// A local stand-in for Twitch: Helix over HTTP, IRC over a socket, EventSub over a WebSocket.
+    struct FakeTwitch {
+        // Kept so the server keeps answering for as long as the test runs.
+        _http: MockHttp,
+        endpoints: Endpoints,
+    }
+
+    fn fake_twitch(behaviour: Behaviour) -> FakeTwitch {
+        let (irc_tx, irc_rx) = mpsc::channel();
+        let (eventsub_tx, eventsub_rx) = mpsc::channel();
+        let fan = Fanout {
+            irc: irc_tx,
+            eventsub: eventsub_tx,
+            behaviour,
+            counter: Arc::new(AtomicUsize::new(0)),
+        };
+        let irc_port = spawn_irc(&fan, irc_rx);
+        let ws_port = spawn_eventsub(eventsub_rx);
         let http = MockHttp::start(move |request: &Request| match request.path.as_str() {
             "/eventsub/subscriptions" => {
                 assert!(
@@ -660,23 +917,11 @@ mod tests {
                 (202, r#"{"data":[{"id":"sub"}]}"#.to_owned())
             }
             "/chat/messages" => {
-                assert!(
-                    request.body.contains("\"sender_id\":\"42\"")
-                        && request.body.contains("pyxeetb latency probe"),
-                    "{}",
-                    request.body
-                );
-                let id = format!("msg-{}", counter.fetch_add(1, Ordering::SeqCst));
-                let (irc_tx, ws_tx) = channels.lock().unwrap().clone();
-                let (a, b) = (id.clone(), id.clone());
-                thread::spawn(move || {
-                    thread::sleep(irc_delay);
-                    let _ = irc_tx.send(a);
-                });
-                thread::spawn(move || {
-                    thread::sleep(eventsub_delay);
-                    let _ = ws_tx.send(b);
-                });
+                let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+                assert_eq!(body["sender_id"], "42");
+                let text = body["message"].as_str().unwrap().to_owned();
+                assert!(text.starts_with("pyxeetb latency probe"), "{text}");
+                let id = fan.post("msg", &text);
                 (
                     200,
                     format!(r#"{{"data":[{{"message_id":"{id}","is_sent":true}}]}}"#),
@@ -692,7 +937,10 @@ mod tests {
             irc_tls: false,
             ..Endpoints::default()
         };
-        FakeTwitch { http, endpoints }
+        FakeTwitch {
+            _http: http,
+            endpoints,
+        }
     }
 
     fn plan<'a>(
@@ -700,6 +948,7 @@ mod tests {
         http: &'a Http,
         tokens: &'a Tokens,
         count: usize,
+        send_via: SendVia,
     ) -> Plan<'a> {
         Plan {
             endpoints: &fake.endpoints,
@@ -707,6 +956,7 @@ mod tests {
             tokens,
             channel: "pylxyr",
             broadcaster_id: "42",
+            send_via,
             count,
             gap: Duration::from_millis(5),
         }
@@ -714,10 +964,11 @@ mod tests {
 
     #[test]
     fn every_message_is_matched_on_both_routes_and_the_slower_route_shows_its_delay() {
-        let fake = fake_twitch(Duration::from_millis(10), Duration::from_millis(80), true);
+        let fake = fake_twitch(Behaviour::healthy(10, 80));
         let (http, tokens) = (Http::new(), tokens());
-        let outcome = run(&plan(&fake, &http, &tokens, 3));
-        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        let plan = plan(&fake, &http, &tokens, 3, SendVia::Helix);
+        let outcome = run(&plan);
+        assert_eq!(outcome.problems, Vec::<String>::new());
         assert_eq!(outcome.rows.len(), 3);
         for row in &outcome.rows {
             let (irc, es) = (
@@ -729,9 +980,9 @@ mod tests {
                 "EventSub was set 70 ms later than IRC but the gap is {:.1} ms",
                 es - irc
             );
-            assert!(irc >= 10.0 && row.http >= 0.0);
+            assert!(irc >= 10.0 && row.send.is_some_and(|s| s >= 0.0));
         }
-        let report = build_report(&plan(&fake, &http, &tokens, 3), &outcome).render();
+        let report = build_report(&plan, &outcome).render();
         assert!(
             report.contains("eventsub minus irc") && report.contains("IRC 3, EventSub 0"),
             "{report}"
@@ -740,14 +991,68 @@ mod tests {
             report.contains("messages sent         3 of 3 planned"),
             "{report}"
         );
-        drop(fake.http);
+        assert!(
+            report.contains("Helix (POST /chat/messages)") && report.contains("send round trip"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn sending_over_irc_finds_each_message_by_its_text_and_times_both_echoes() {
+        let fake = fake_twitch(Behaviour::healthy(20, 70));
+        let (http, tokens) = (Http::new(), tokens());
+        let plan = plan(&fake, &http, &tokens, 3, SendVia::Irc);
+        let outcome = run(&plan);
+        assert_eq!(outcome.problems, Vec::<String>::new());
+        assert_eq!(outcome.rows.len(), 3);
+        for row in &outcome.rows {
+            assert_eq!(row.send, None, "no HTTP request was made");
+            let (irc, es) = (
+                row.irc.expect("IRC echo"),
+                row.eventsub.expect("EventSub echo"),
+            );
+            assert!(
+                irc >= 15.0 && es - irc > 25.0,
+                "irc {irc:.1} ms, eventsub {es:.1} ms"
+            );
+        }
+        let report = build_report(&plan, &outcome).render();
+        assert!(
+            report.contains("IRC (PRIVMSG on its own connection)"),
+            "{report}"
+        );
+        assert!(!report.contains("send round trip"), "{report}");
+    }
+
+    #[test]
+    fn an_irc_sender_that_cannot_log_in_is_a_problem_and_sends_nothing() {
+        let fake = fake_twitch(Behaviour {
+            sender_login_ok: false,
+            ..Behaviour::healthy(5, 5)
+        });
+        let (http, tokens) = (Http::new(), tokens());
+        let outcome = run(&plan(&fake, &http, &tokens, 2, SendVia::Irc));
+        assert_eq!(outcome.rows, Vec::new());
+        assert!(
+            outcome
+                .problems
+                .iter()
+                .any(|p| p.contains("IRC sender could not start")
+                    && p.contains("authentication failed")),
+            "{:?}",
+            outcome.problems
+        );
     }
 
     #[test]
     fn a_route_that_cannot_log_in_is_reported_and_the_other_is_still_measured() {
-        let fake = fake_twitch(Duration::from_millis(5), Duration::from_millis(20), false);
+        let fake = fake_twitch(Behaviour {
+            receiver_login_ok: false,
+            ..Behaviour::healthy(5, 20)
+        });
         let (http, tokens) = (Http::new(), tokens());
-        let outcome = run(&plan(&fake, &http, &tokens, 2));
+        let plan = plan(&fake, &http, &tokens, 2, SendVia::Helix);
+        let outcome = run(&plan);
         assert!(
             outcome
                 .problems
@@ -763,7 +1068,7 @@ mod tests {
                 .iter()
                 .all(|r| r.irc.is_none() && r.eventsub.is_some())
         );
-        let report = build_report(&plan(&fake, &http, &tokens, 2), &outcome).render();
+        let report = build_report(&plan, &outcome).render();
         assert!(
             report.contains("IRC delivered 0 of 2 messages")
                 && report.contains("problem: IRC stopped"),
@@ -777,7 +1082,7 @@ mod tests {
 
     #[test]
     fn a_refused_send_is_a_problem_and_stops_the_run() {
-        let fake = fake_twitch(Duration::from_millis(5), Duration::from_millis(5), true);
+        let fake = fake_twitch(Behaviour::healthy(5, 5));
         let rejecting = MockHttp::start(|request: &Request| match request.path.as_str() {
             "/eventsub/subscriptions" => (202, "{}".to_owned()),
             _ => (
@@ -797,6 +1102,7 @@ mod tests {
             tokens: &tokens,
             channel: "pylxyr",
             broadcaster_id: "42",
+            send_via: SendVia::Helix,
             count: 5,
             gap: Duration::from_millis(1),
         };
@@ -830,17 +1136,17 @@ mod tests {
     fn the_first_to_arrive_is_counted_per_message() {
         let rows = [
             Row {
-                http: 1.0,
+                send: Some(1.0),
                 irc: Some(100.0),
                 eventsub: Some(120.0),
             },
             Row {
-                http: 1.0,
+                send: Some(1.0),
                 irc: Some(150.0),
                 eventsub: Some(110.0),
             },
             Row {
-                http: 1.0,
+                send: Some(1.0),
                 irc: Some(100.0),
                 eventsub: None,
             },
@@ -856,9 +1162,14 @@ mod tests {
             irc: Some(later),
             eventsub: None,
         };
-        let row = row_for(started, Duration::from_millis(100), Some(&seen));
-        assert!((row.http - 100.0).abs() < 1e-6);
+        let row = row_for(started, Some(Duration::from_millis(100)), Some(&seen));
+        assert!((row.send.unwrap() - 100.0).abs() < 1e-6);
         assert!((row.irc.unwrap() - 120.0).abs() < 1e-6);
         assert_eq!(row.eventsub, None);
+        assert_eq!(
+            row_for(started, None, Some(&seen)).send,
+            None,
+            "an IRC send has no HTTP time"
+        );
     }
 }

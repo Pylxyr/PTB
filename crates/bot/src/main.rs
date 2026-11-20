@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use pyxeetb_twitch::oauth::{self, Tokens};
 
-use crate::cli::{Account, Command, LatencyOptions};
+use crate::cli::{Account, AuthOptions, Command, LatencyOptions, SendVia};
 use crate::endpoints::Endpoints;
 use crate::error::{Context, Error, Result};
 use crate::http::Http;
@@ -42,7 +42,9 @@ fn run_probe(options: &cli::ProbeOptions) -> Result<()> {
     Ok(())
 }
 
-fn run_auth(account: &Account) -> Result<()> {
+fn run_auth(options: &AuthOptions) -> Result<()> {
+    let account = &options.account;
+    let scopes = oauth::scopes_for(options.irc_send);
     let (http, endpoints, store) = (Http::new(), Endpoints::default(), store_for(account));
     let client = auth::Client {
         http: &http,
@@ -50,7 +52,7 @@ fn run_auth(account: &Account) -> Result<()> {
         app_id: &account.client_id,
         app_secret: account.client_secret.as_ref(),
     };
-    let tokens = client.login(oauth::LATENCY_SCOPES, &mut io::stdout(), &thread::sleep)?;
+    let tokens = client.login(&scopes, &mut io::stdout(), &thread::sleep)?;
     store.save(&tokens)?;
     println!("\nLogged in as {} (id {}).", tokens.login, tokens.user_id);
     println!(
@@ -58,7 +60,7 @@ fn run_auth(account: &Account) -> Result<()> {
         tokens.expires_at.saturating_sub(unix_now()) / 60,
         store.path().display()
     );
-    let missing = tokens.missing_scopes(oauth::LATENCY_SCOPES);
+    let missing = tokens.missing_scopes(&scopes);
     if !missing.is_empty() {
         println!(
             "Warning: Twitch did not grant these permissions: {}",
@@ -68,20 +70,30 @@ fn run_auth(account: &Account) -> Result<()> {
     Ok(())
 }
 
-/// The saved login, renewed if it is about to expire.
-fn fresh_login(account: &Account, client: &auth::Client<'_>, store: &TokenStore) -> Result<Tokens> {
+/// The saved login, renewed if it is about to expire, and checked for the permissions `required` lists.
+fn fresh_login(
+    account: &Account,
+    client: &auth::Client<'_>,
+    store: &TokenStore,
+    required: &[&str],
+) -> Result<Tokens> {
     let tokens = store.load()?.context(&format!(
         "no saved login in {}; run `pyxeetb auth` first",
         store.path().display()
     ))?;
     let tokens = client.ensure_fresh(store, tokens, unix_now())?;
-    let missing = tokens.missing_scopes(oauth::LATENCY_SCOPES);
+    let missing = tokens.missing_scopes(required);
     if missing.is_empty() {
         Ok(tokens)
     } else {
         Err(Error::new(format!(
-            "the saved login lacks permissions ({}); run `pyxeetb auth` again",
-            missing.join(", ")
+            "the saved login lacks permissions ({}); run `pyxeetb auth{}` again",
+            missing.join(", "),
+            if missing.contains(&oauth::IRC_SEND_SCOPE) {
+                " --with-irc-send"
+            } else {
+                ""
+            }
         )))
         .context(&format!("app {}", account.client_id))
     }
@@ -117,7 +129,8 @@ fn run_latency(options: &LatencyOptions) -> Result<()> {
         app_id: &account.client_id,
         app_secret: account.client_secret.as_ref(),
     };
-    let tokens = fresh_login(account, &client, &store)?;
+    let required = oauth::scopes_for(options.send_via == SendVia::Irc);
+    let tokens = fresh_login(account, &client, &store, &required)?;
     let channel = options
         .channel
         .clone()
@@ -125,8 +138,15 @@ fn run_latency(options: &LatencyOptions) -> Result<()> {
     let broadcaster_id = channel_id(&client, &tokens, &channel)?;
 
     eprintln!(
-        "About to post {} short test messages in #{channel} as {}, {} ms apart.",
-        options.count, tokens.login, options.gap_ms
+        "About to post {} short test messages in #{channel} as {} (sent over {}), {} ms apart.",
+        options.count,
+        tokens.login,
+        if options.send_via == SendVia::Irc {
+            "IRC"
+        } else {
+            "Helix"
+        },
+        options.gap_ms
     );
     eprintln!("Viewers will see them. Press Ctrl+C within 5 seconds to cancel.");
     io::stderr().flush().context("writing to the terminal")?;
@@ -138,6 +158,7 @@ fn run_latency(options: &LatencyOptions) -> Result<()> {
         tokens: &tokens,
         channel: &channel,
         broadcaster_id: &broadcaster_id,
+        send_via: options.send_via,
         count: options.count,
         gap: Duration::from_millis(options.gap_ms),
     };
@@ -161,7 +182,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         Ok(Command::Probe(options)) => run_probe(&options),
-        Ok(Command::Auth(account)) => run_auth(&account),
+        Ok(Command::Auth(options)) => run_auth(&options),
         Ok(Command::Latency(options)) => run_latency(&options),
         Err(message) => {
             eprintln!("error: {message}\n\n{}", cli::USAGE);

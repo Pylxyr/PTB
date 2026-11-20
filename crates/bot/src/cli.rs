@@ -1,6 +1,7 @@
 //! Command-line parsing: small, dependency-free, and tested.
 
 use pyxeetb_twitch::Secret;
+use pyxeetb_twitch::oauth;
 
 pub const USAGE: &str = "\
 pyxeetb - a fast, self-hosted Twitch chat bot, alerts and overlay engine
@@ -21,11 +22,15 @@ PROBE OPTIONS:
     --out <FILE>           Where to write the report (default probe-report.txt)
 
 AUTH AND LATENCY OPTIONS:
-    --client-id <ID>       Your Twitch app's client id (or set PYXEETB_CLIENT_ID)
+    --client-id <ID>       Your Twitch app's client id, about 30 letters and digits (or set PYXEETB_CLIENT_ID)
     --state-dir <DIR>      Where the login is kept (default ~/.config/pyxeetb, or PYXEETB_STATE_DIR)
     PYXEETB_CLIENT_SECRET  Environment variable: the app's secret, only if it is a confidential app
 
+AUTH OPTIONS:
+    --with-irc-send        Also ask for the permission to send chat over IRC (only for `latency --send-via irc`)
+
 LATENCY OPTIONS:
+    --send-via <ROUTE>     How the test messages are sent: helix (default) or irc
     --channel <LOGIN>      Channel to test in (default: your own)
     --count <N>            Test messages to send (1-50, default 10)
     --gap-ms <MS>          Pause between test messages (500-30000, default 2500)
@@ -62,9 +67,24 @@ pub struct Account {
     pub state_dir: Option<String>,
 }
 
+/// How the latency test sends its messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendVia {
+    Helix,
+    Irc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthOptions {
+    pub account: Account,
+    /// Also ask for the permission to write over IRC.
+    pub irc_send: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatencyOptions {
     pub account: Account,
+    pub send_via: SendVia,
     pub channel: Option<String>,
     pub count: usize,
     pub gap_ms: u64,
@@ -75,20 +95,25 @@ pub enum Command {
     Help,
     Version,
     Probe(ProbeOptions),
-    Auth(Account),
+    Auth(AuthOptions),
     Latency(LatencyOptions),
 }
 
 /// `--name value` and `--name=value` pairs, each readable once.
+/// `--name value` and `--name=value` pairs, plus value-less switches, each readable once.
 struct Flags(Vec<(String, String)>);
 
 impl Flags {
-    fn parse(args: &[String], allowed: &[&str]) -> Result<Option<Self>, String> {
+    fn parse(args: &[String], allowed: &[&str], switches: &[&str]) -> Result<Option<Self>, String> {
         let mut pairs = Vec::new();
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             if matches!(arg.as_str(), "-h" | "--help") {
                 return Ok(None);
+            }
+            if switches.contains(&arg.as_str()) {
+                pairs.push((arg.clone(), "true".to_owned()));
+                continue;
             }
             let (name, inline) = arg
                 .split_once('=')
@@ -106,6 +131,10 @@ impl Flags {
             pairs.push((name.to_owned(), value));
         }
         Ok(Some(Self(pairs)))
+    }
+
+    fn switch(&self, name: &str) -> bool {
+        self.0.iter().any(|(n, _)| n == name)
     }
 
     fn text(&self, name: &str) -> Option<String> {
@@ -141,6 +170,11 @@ fn account(flags: &Flags, env: &dyn Fn(&str) -> Option<String>) -> Result<Accoun
         .or_else(|| env("PYXEETB_CLIENT_ID"))
         .filter(|id| !id.is_empty())
         .ok_or("a client id is needed: pass --client-id or set PYXEETB_CLIENT_ID")?;
+    if !oauth::looks_like_client_id(&client_id) {
+        return Err(format!(
+            "'{client_id}' does not look like a Twitch client id (about 30 letters and digits, no spaces or dashes); copy it from dev.twitch.tv/console"
+        ));
+    }
     Ok(Account {
         client_id,
         client_secret: env("PYXEETB_CLIENT_SECRET")
@@ -148,6 +182,14 @@ fn account(flags: &Flags, env: &dyn Fn(&str) -> Option<String>) -> Result<Accoun
             .map(Secret::new),
         state_dir: flags.text("--state-dir"),
     })
+}
+
+fn send_via(flags: &Flags) -> Result<SendVia, String> {
+    match flags.text("--send-via").as_deref() {
+        None | Some("helix") => Ok(SendVia::Helix),
+        Some("irc") => Ok(SendVia::Irc),
+        Some(other) => Err(format!("--send-via must be helix or irc, got '{other}'")),
+    }
 }
 
 /// Parse the arguments after the program name. `env` reads an environment variable.
@@ -158,12 +200,15 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Co
     let Some((first, rest)) = args.split_first() else {
         return Ok(Command::Help);
     };
-    let flags = |allowed: &[&str]| Flags::parse(rest, allowed);
+    let flags = |allowed: &[&str], switches: &[&str]| Flags::parse(rest, allowed, switches);
     match first.as_str() {
         "-h" | "--help" | "help" => Ok(Command::Help),
         "-V" | "--version" | "version" => Ok(Command::Version),
         "probe" => {
-            let Some(f) = flags(&["--samples", "--burst-seconds", "--jitter-seconds", "--out"])?
+            let Some(f) = flags(
+                &["--samples", "--burst-seconds", "--jitter-seconds", "--out"],
+                &[],
+            )?
             else {
                 return Ok(Command::Help);
             };
@@ -180,24 +225,32 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Co
             }))
         }
         "auth" => {
-            let Some(f) = flags(&["--client-id", "--state-dir"])? else {
+            let Some(f) = flags(&["--client-id", "--state-dir"], &["--with-irc-send"])? else {
                 return Ok(Command::Help);
             };
-            Ok(Command::Auth(account(&f, env)?))
+            Ok(Command::Auth(AuthOptions {
+                account: account(&f, env)?,
+                irc_send: f.switch("--with-irc-send"),
+            }))
         }
         "latency" => {
-            let Some(f) = flags(&[
-                "--client-id",
-                "--state-dir",
-                "--channel",
-                "--count",
-                "--gap-ms",
-            ])?
+            let Some(f) = flags(
+                &[
+                    "--client-id",
+                    "--state-dir",
+                    "--channel",
+                    "--count",
+                    "--gap-ms",
+                    "--send-via",
+                ],
+                &[],
+            )?
             else {
                 return Ok(Command::Help);
             };
             Ok(Command::Latency(LatencyOptions {
                 account: account(&f, env)?,
+                send_via: send_via(&f)?,
                 channel: f
                     .text("--channel")
                     .map(|c| c.trim_start_matches('#').to_ascii_lowercase()),
@@ -291,6 +344,16 @@ mod tests {
         assert!(err(&["serve"]).contains("unknown command"));
     }
 
+    const ID: &str = "hof5gwx0su6owfnys0nyan9c87zr6t";
+
+    fn account_of(command: Command) -> Account {
+        match command {
+            Command::Auth(options) => options.account,
+            Command::Latency(options) => options.account,
+            other => panic!("not a command with an account: {other:?}"),
+        }
+    }
+
     #[test]
     fn auth_needs_a_client_id_from_a_flag_or_the_environment() {
         assert!(
@@ -299,35 +362,86 @@ mod tests {
                 .contains("client id")
         );
         let from_flag = parse(
-            &args(&["auth", "--client-id", "abc", "--state-dir", "/s"]),
+            &args(&["auth", "--client-id", ID, "--state-dir", "/s"]),
             &no_env,
         )
         .unwrap();
         assert_eq!(
             from_flag,
-            Command::Auth(Account {
-                client_id: "abc".into(),
-                client_secret: None,
-                state_dir: Some("/s".into())
+            Command::Auth(AuthOptions {
+                account: Account {
+                    client_id: ID.into(),
+                    client_secret: None,
+                    state_dir: Some("/s".into())
+                },
+                irc_send: false,
             })
         );
         let env = |name: &str| match name {
-            "PYXEETB_CLIENT_ID" => Some("from-env".to_owned()),
+            "PYXEETB_CLIENT_ID" => Some(ID.to_owned()),
             "PYXEETB_CLIENT_SECRET" => Some("shh".to_owned()),
             _ => None,
         };
-        let Command::Auth(account) = parse(&args(&["auth"]), &env).unwrap() else {
-            panic!("not auth")
-        };
+        let account = account_of(parse(&args(&["auth"]), &env).unwrap());
         assert_eq!(
             (
                 account.client_id.as_str(),
                 account.client_secret.as_ref().map(Secret::expose)
             ),
-            ("from-env", Some("shh"))
+            (ID, Some("shh"))
         );
-        let overridden = parse(&args(&["auth", "--client-id", "flag"]), &env).unwrap();
-        assert!(matches!(overridden, Command::Auth(a) if a.client_id == "flag"));
+        let other = "abcdefghijklmnopqrstuvwxyz0123";
+        assert_eq!(
+            account_of(parse(&args(&["auth", "--client-id", other]), &env).unwrap()).client_id,
+            other
+        );
+    }
+
+    #[test]
+    fn a_placeholder_or_pasted_typo_is_refused_before_twitch_is_asked() {
+        for bad in ["your-client-id", "abc", "has space in the middle of it", ""] {
+            let err = parse(&args(&["auth", "--client-id", bad]), &no_env).unwrap_err();
+            assert!(err.contains("client id"), "{bad:?}: {err}");
+        }
+        let err = parse(
+            &args(&["latency", "--client-id", "your-client-id"]),
+            &no_env,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not look like a Twitch client id")
+                && err.contains("dev.twitch.tv/console"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn irc_sending_needs_its_own_permission_and_only_when_asked_for() {
+        let plain = parse(&args(&["auth", "--client-id", ID]), &no_env).unwrap();
+        assert!(matches!(
+            plain,
+            Command::Auth(AuthOptions {
+                irc_send: false,
+                ..
+            })
+        ));
+        let with = parse(
+            &args(&["auth", "--client-id", ID, "--with-irc-send"]),
+            &no_env,
+        )
+        .unwrap();
+        assert!(matches!(
+            with,
+            Command::Auth(AuthOptions { irc_send: true, .. })
+        ));
+        assert!(
+            parse(
+                &args(&["latency", "--client-id", ID, "--with-irc-send"]),
+                &no_env
+            )
+            .is_err(),
+            "only auth takes it"
+        );
     }
 
     #[test]
@@ -336,7 +450,7 @@ mod tests {
             &args(&[
                 "latency",
                 "--client-id",
-                "c",
+                ID,
                 "--channel",
                 "#PyLxyr",
                 "--count",
@@ -353,20 +467,21 @@ mod tests {
             (options.channel.as_deref(), options.count, options.gap_ms),
             (Some("pylxyr"), 3, 600)
         );
-        let defaults = parse(&args(&["latency", "--client-id", "c"]), &no_env).unwrap();
+        assert_eq!(options.send_via, SendVia::Helix);
+        let defaults = parse(&args(&["latency", "--client-id", ID]), &no_env).unwrap();
         assert!(
             matches!(defaults, Command::Latency(o) if o.count == 10 && o.gap_ms == 2500 && o.channel.is_none())
         );
         assert!(
             parse(
-                &args(&["latency", "--client-id", "c", "--count", "51"]),
+                &args(&["latency", "--client-id", ID, "--count", "51"]),
                 &no_env
             )
             .is_err()
         );
         assert!(
             parse(
-                &args(&["latency", "--client-id", "c", "--gap-ms", "100"]),
+                &args(&["latency", "--client-id", ID, "--gap-ms", "100"]),
                 &no_env
             )
             .is_err()
@@ -374,12 +489,24 @@ mod tests {
     }
 
     #[test]
+    fn the_send_route_is_helix_or_irc_and_nothing_else() {
+        let via = |value: &str| match parse(
+            &args(&["latency", "--client-id", ID, "--send-via", value]),
+            &no_env,
+        ) {
+            Ok(Command::Latency(options)) => Ok(options.send_via),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e),
+        };
+        assert_eq!(via("helix"), Ok(SendVia::Helix));
+        assert_eq!(via("irc"), Ok(SendVia::Irc));
+        assert!(via("carrier-pigeon").unwrap_err().contains("helix or irc"));
+    }
+
+    #[test]
     fn an_empty_secret_counts_as_none() {
         let env = |name: &str| (name == "PYXEETB_CLIENT_SECRET").then(String::new);
-        let Command::Auth(account) = parse(&args(&["auth", "--client-id", "c"]), &env).unwrap()
-        else {
-            panic!("not auth")
-        };
+        let account = account_of(parse(&args(&["auth", "--client-id", ID]), &env).unwrap());
         assert_eq!(account.client_secret, None);
     }
 }

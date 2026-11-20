@@ -166,6 +166,13 @@ pub fn login_lines(login: &str, token: &Secret, channel: &str) -> String {
     )
 }
 
+/// The line that posts `text` in a channel. Line breaks are removed, because they would end the command early.
+#[must_use]
+pub fn privmsg_line(channel: &str, text: &str) -> String {
+    let flat: String = text.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+    format!("PRIVMSG #{} :{flat}\r\n", channel.to_ascii_lowercase())
+}
+
 /// The reply to `PING :server`, if this message is one.
 #[must_use]
 pub fn pong_for(message: &Message) -> Option<String> {
@@ -291,6 +298,19 @@ mod tests {
                 .unwrap()
                 .login_failure(),
             None
+        );
+    }
+
+    #[test]
+    fn a_post_is_one_line_in_a_lowercase_channel() {
+        assert_eq!(
+            privmsg_line("PyLxyr", "hello world"),
+            "PRIVMSG #pylxyr :hello world\r\n"
+        );
+        assert_eq!(
+            privmsg_line("c", "two\r\nlines\nhere"),
+            "PRIVMSG #c :twolineshere\r\n",
+            "an injected line break cannot add a command"
         );
     }
 

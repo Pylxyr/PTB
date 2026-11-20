@@ -13,6 +13,26 @@ pub const ID_BASE: &str = "https://id.twitch.tv/oauth2";
 /// What the latency harness needs: read chat (EventSub), send chat (Helix) and read chat over IRC.
 pub const LATENCY_SCOPES: &[&str] = &["user:read:chat", "user:write:chat", "chat:read"];
 
+/// Needed only to send chat messages over IRC (`latency --send-via irc`).
+pub const IRC_SEND_SCOPE: &str = "chat:edit";
+
+/// The permissions to ask for; `irc_send` adds the one that lets the bot write over IRC.
+#[must_use]
+pub fn scopes_for(irc_send: bool) -> Vec<&'static str> {
+    let mut scopes = LATENCY_SCOPES.to_vec();
+    if irc_send {
+        scopes.push(IRC_SEND_SCOPE);
+    }
+    scopes
+}
+
+/// A cheap check that catches a placeholder or a typo before Twitch is asked: real client ids are about 30
+/// letters and digits, so anything with other characters, or far from that length, is refused.
+#[must_use]
+pub fn looks_like_client_id(text: &str) -> bool {
+    (20..=40).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// Renew a token this many seconds before it expires, so a request never races the expiry.
 pub const REFRESH_MARGIN_SECS: u64 = 300;
 
@@ -403,6 +423,26 @@ mod tests {
         assert_eq!(error_message(r#"{"message":"nope"}"#), "nope");
         assert_eq!(error_message("  plain text  "), "plain text");
         assert_eq!(error_message(&"x".repeat(500)).len(), 200);
+    }
+
+    #[test]
+    fn the_irc_send_permission_is_only_asked_for_when_wanted() {
+        assert_eq!(scopes_for(false), LATENCY_SCOPES);
+        assert_eq!(scopes_for(true).last().copied(), Some("chat:edit"));
+        assert_eq!(scopes_for(true).len(), LATENCY_SCOPES.len() + 1);
+    }
+
+    #[test]
+    fn placeholders_and_typos_are_not_client_ids() {
+        assert!(looks_like_client_id("hof5gwx0su6owfnys0nyan9c87zr6t"));
+        assert!(!looks_like_client_id("your-client-id"));
+        assert!(!looks_like_client_id("abc"));
+        assert!(!looks_like_client_id(&"a".repeat(41)));
+        assert!(
+            !looks_like_client_id("hof5gwx0su6owfnys0nyan9c87zr6t "),
+            "a trailing space from a paste"
+        );
+        assert!(!looks_like_client_id(""));
     }
 
     #[test]

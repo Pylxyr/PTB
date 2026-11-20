@@ -34,6 +34,10 @@ export PYXEETB_CLIENT_SECRET=your-secret   # confidential apps only; never put i
   `~/.config/pyxeetb/tokens.json` (override with `--state-dir` or `PYXEETB_STATE_DIR`), readable by you only.
   It is renewed automatically, and written so that a crash cannot lose it (Twitch replaces the refresh token on
   every renewal).
+- `latency --send-via irc` sends the test messages over IRC (on a second connection) instead of Helix, to compare the
+  two send paths on the same account. It needs one more permission, so log in once with `./pyxeetb auth --with-irc-send`.
+- A client id that is clearly a placeholder or a typo (it should be about 30 letters and digits) is refused before
+  Twitch is asked.
 - `latency` sends each test message through Helix and waits for it to come back over **both** IRC and EventSub,
   timing everything on this machine's own clock. It reports the send round trip, how long each route takes to
   deliver, and which is first. Viewers see the test messages, so run it while offline or in a test channel;
